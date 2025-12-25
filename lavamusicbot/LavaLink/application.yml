@@ -1,0 +1,82 @@
+server: # REST and WS server
+  port: 2333
+  address: 0.0.0.0
+plugins:
+  lavasrc:
+    providers:
+      - "ytsearch:\"%ISRC%\"" # Will search YouTube for the ISRC found on Spotify/Apple Music
+      - "ytsearch:%QUERY%"    # Fallback
+    sources:
+      spotify: true
+      applemusic: true # Enabled Apple Music
+      deezer: false
+      yandexmusic: false
+      flowerytts: false
+      youtube: true
+    spotify:
+      clientId: "ee733c14d1374e61a34bfbeb6a712bb5" 
+      clientSecret: "f647f39b401942058fdf12ee4cc73e0e" 
+      countryCode: "US"
+      playlistLoadLimit: 6
+      albumLoadLimit: 6
+    applemusic:
+      countryCode: "US"
+      # --- IMPORTANT: PASTE YOUR TOKEN BELOW ---
+      mediaAPIToken: "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IldlYlBsYXlLaWQifQ.eyJpc3MiOiJBTVBXZWJQbGF5IiwiaWF0IjoxNzYyNTM4NTI0LCJleHAiOjE3Njk3OTYxMjQsInJvb3RfaHR0cHNfb3JpZ2luIjpbImFwcGxlLmNvbSJdfQ.2fpk1NEdRGBhrWjhjDJfeVWQyfa005cJYQ0Ye37GeD08vuyZvVA1xOc0JiePTEa9FLHa1HZjLd3n5F0CYUqLTw" 
+      playlistLoadLimit: 6
+      albumLoadLimit: 6
+lavalink:
+  plugins:
+    # UPDATED to 4.8.1 (Fixes the crash)
+    - dependency: "com.github.topi314.lavasrc:lavasrc-plugin:4.8.1"
+      snapshot: false
+    # UPDATED to 1.16.0 (Latest YouTube fix)
+    - dependency: "dev.lavalink.youtube:youtube-plugin:1.16.0"
+  server:
+    password: "youshallnotpass"
+    sources:
+      youtube: false # Disabled because we use the plugin above
+      bandcamp: true
+      soundcloud: true
+      twitch: true
+      vimeo: true
+      http: true
+      local: false
+    filters: 
+      volume: true
+      equalizer: true
+      karaoke: true
+      timescale: true
+      tremolo: true
+      vibrato: true
+      distortion: true
+      rotation: true
+      channelMix: true
+      lowPass: true
+    bufferDurationMs: 400
+    frameBufferDurationMs: 5000
+    opusEncodingQuality: 10
+    resamplingQuality: LOW
+    trackStuckThresholdMs: 10000
+    useSeekGhosting: true
+    youtubePlaylistLoadLimit: 6
+    playerUpdateInterval: 5
+    youtubeSearchEnabled: true
+    soundcloudSearchEnabled: true
+    gc-warnings: true
+
+metrics:
+  prometheus:
+    enabled: false
+    endpoint: /metrics
+
+sentry:
+  dsn: ""
+  environment: ""
+
+logging:
+  file:
+    path: ./logs/
+  level:
+    root: INFO
+    lavalink: INFO
