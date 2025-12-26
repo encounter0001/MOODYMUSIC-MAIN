@@ -79,7 +79,7 @@ if owner_env:
             OWNER_IDS.append(int(id_str))
 
 # Lavalink Configuration
-LAVALINK_URI = os.getenv("LAVALINK_URI", "http://us7.endercloud.in:4577")
+LAVALINK_URI = os.getenv("LAVALINK_URI", "http://localhost:2333")
 LAVALINK_PASS = os.getenv("LAVALINK_PASS", "youshallnotpass")
 LAVALINK_IDENTIFIER = os.getenv("LAVALINK_ID", "main_node")
 
@@ -137,9 +137,9 @@ class AIRecommender:
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
-                        self.url,
-                        json=payload,
-                        timeout=timeout_seconds
+                            self.url,
+                            json=payload,
+                            timeout=timeout_seconds
                     ) as resp:
 
                         if resp.status != 200:
@@ -347,6 +347,8 @@ class DatabaseManager:
             port=int(os.getenv("REDIS_PORT", 6379)),
             password=os.getenv("REDIS_PASSWORD", None),
             db=int(os.getenv("REDIS_DB", 0)),
+            ssl=True,
+            ssl_cert_reqs=None,
             decode_responses=True # crucial so you get strings, not bytes
         )
         try:
@@ -383,15 +385,15 @@ class DatabaseManager:
             return False
 
     def get_redis_latency(self) -> int:
-            """Measure Redis round-trip latency in milliseconds."""
-            try:
-                start = time.perf_counter()
-                self.r.ping()
-                end = time.perf_counter()
-                return int((end - start) * 1000)
-            except Exception as e:
-                logger.error(f"Redis ping failed: {e}")
-                return -1
+        """Measure Redis round-trip latency in milliseconds."""
+        try:
+            start = time.perf_counter()
+            self.r.ping()
+            end = time.perf_counter()
+            return int((end - start) * 1000)
+        except Exception as e:
+            logger.error(f"Redis ping failed: {e}")
+            return -1
 
     def get_247_channel(self, guild_id: int) -> Optional[int]:
         """Return saved 24/7 channel id or None."""
@@ -442,7 +444,7 @@ class DatabaseManager:
                 "author": (str(author) if author else "")[:200]
             })
             key = f"guild:{guild_id}:history"
-            
+
             pipe = self.r.pipeline()
             pipe.lpush(key, data)
             pipe.ltrim(key, 0, 99) # Keep only top 100
@@ -460,7 +462,7 @@ class DatabaseManager:
             # Get top 2 items
             items = self.r.lrange(key, 0, 1)
             results = []
-            
+
             # Redis lists don't have 'IDs' like SQL, so we return 0 as a dummy ID
             # The bot uses index 0 [title] and index 2 [author] mostly.
             for item in items:
@@ -517,8 +519,8 @@ def is_owner_or_admin():
 class FailSafe(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.last_positions = {}  # {guild_id: position_ms}
-        self.stuck_counts = {}    # {guild_id: count}
+        self.last_positions = {}
+        self.stuck_counts = {}
         self.player_watchdog.start()
 
     def cog_unload(self):
@@ -526,132 +528,108 @@ class FailSafe(commands.Cog):
 
     @tasks.loop(seconds=30)
     async def player_watchdog(self):
-        """Background task: Handles Stuck Songs & 10-Minute AFK Timeout."""
+        """Background task: Handles Stuck Songs, Ghost Sessions & Stage/AFK Timeouts."""
         for guild in self.bot.guilds:
             if not guild.voice_client:
                 continue
-            
+
             vc: wavelink.Player = guild.voice_client
-            
+
+            # --- LOGIC 1: DETECT GHOST SESSIONS (404) ---
             if not vc.connected:
                 continue
+            try:
+                if not vc.channel:
+                    await self.emergency_disconnect(guild, "Channel Invalid/Deleted")
+                    continue
+            except Exception:
+                pass
 
-            # --- LOGIC 1: AFK TIMEOUT (10 Minutes) ---
+            # --- LOGIC 2: AFK & STAGE TIMEOUT ---
             try:
                 channel = vc.channel
                 if channel:
                     members = channel.members
-                    # Count humans (ignore bots)
                     humans = [m for m in members if not m.bot]
-                    
+
+                    # STAGE CHANNEL SPECIFIC LOGIC
+                    is_stage = isinstance(channel, discord.StageChannel)
+                    # 40 checks * 30s = 20 mins for Stage, 20 checks = 10 mins for Voice
+                    timeout_limit = 40 if is_stage else 20
+
                     if not humans:
-                        # Bot is alone. Increment counter.
-                        # 20 checks * 30 seconds = 600 seconds (10 Minutes)
                         current_count = getattr(vc, "afk_timer", 0) + 1
                         setattr(vc, "afk_timer", current_count)
-                        
-                        if current_count >= 20: 
-                            logger.info(f"AFK Timeout in {guild.name}. Cleaning up...")
-                            
-                            # 1. Stop Music & Clear Queue
-                            if getattr(vc, "queue", None):
-                                vc.queue.clear()
+
+                        if current_count >= timeout_limit:
+                            reason = "Stage Timeout (20m)" if is_stage else "AFK Timeout"
+                            logger.info(f"{reason} in {guild.name}. Cleaning up...")
+
+                            if getattr(vc, "queue", None): vc.queue.clear()
                             await vc.stop()
-                            try:
-                                db.clear_history(guild.id)
-                            except:
-                                pass
-                            
-                            # 2. Check if a 24/7 Channel is assigned
+                            db.clear_history(guild.id)
+
+                            is_247 = db.get_247_status(guild.id)
                             home_channel_id = db.get_247_channel(guild.id)
-                            
-                            # --- SCENARIO A: NO 24/7 Channel Assigned ---
-                            if not home_channel_id:
-                                # 24/7 is OFF/Unset -> DISCONNECT IMMEDIATELY
-                                await self.emergency_disconnect(guild, "AFK Timeout (10 mins - No 24/7 assigned)")
+
+                            if not is_247 or not home_channel_id:
+                                await self.emergency_disconnect(guild, reason)
                                 continue
 
-                            # --- SCENARIO B: 24/7 Channel IS Assigned ---
-                            # Are we in the wrong channel?
+                            # Return to 24/7 Channel
                             if channel.id != home_channel_id:
                                 try:
                                     home_channel = guild.get_channel(home_channel_id)
                                     if home_channel:
-                                        # Move to the 24/7 channel
                                         await vc.move_to(home_channel)
-                                        
-                                        # Reset timer so we don't disconnect
-                                        setattr(vc, "afk_timer", 0) 
-                                        logger.info(f"Returned to 24/7 Home: {home_channel.name}")
-                                        
-                                        # Notify user
+                                        setattr(vc, "afk_timer", 0)
+
+                                        # Auto-suppress false if moving to stage
+                                        if isinstance(home_channel, discord.StageChannel):
+                                            try: await guild.me.edit(suppress=False)
+                                            except: pass
+
                                         txt_ch = self.bot.get_player_text_channel(guild.id)
                                         if txt_ch:
-                                            ch = self.bot.get_channel(txt_ch)
-                                            await safe_send(ch, f"🏚️ **AFK:** Moving to 24/7 channel: {home_channel.mention}")
-                                            
-                                        # Reset channel status UI
-                                        try:
-                                            await home_channel.edit(status=None)
-                                        except:
-                                            pass
-                                        
-                                        continue # Skip disconnection logic
-                                except Exception as e:
-                                    logger.error(f"Failed to return home: {e}")
-                                    # If move fails, we fall through to disconnect below
-
-                            # --- SCENARIO C: We are IN the 24/7 Channel ---
-                            # Final check: Is the 24/7 mode toggle actually ON?
-                            if not db.get_247_status(guild.id):
-                                # It's in the channel, but the mode is explicitly disabled
-                                await self.emergency_disconnect(guild, "AFK Timeout (24/7 Disabled)")
+                                            await safe_send(self.bot.get_channel(txt_ch), f"🏚️ **{reason}:** Moving back to 24/7 channel: {home_channel.mention}")
+                                    else:
+                                        db.set_247_status(guild.id, False)
+                                        await self.emergency_disconnect(guild, "24/7 Channel Deleted")
+                                except Exception:
+                                    await self.emergency_disconnect(guild, "AFK Move Failed")
                             else:
-                                # All good, stay connected
                                 setattr(vc, "afk_timer", 0)
-                                
                     else:
-                        # Humans present, reset timer
                         setattr(vc, "afk_timer", 0)
             except Exception as e:
-                logger.error(f"Watchdog AFK Check Error: {e}")
+                if "404" in str(e) or "Not Found" in str(e):
+                    logger.error(f"Watchdog detected 404 Ghost Session in {guild.name}")
+                    await self.emergency_disconnect(guild, "Ghost Session (404)")
+                else:
+                    logger.error(f"Watchdog Error: {e}")
 
-            # --- LOGIC 2: STUCK SONG DETECTION ---
-            # Only check if playing and NOT paused
+            # --- LOGIC 3: STUCK SONG DETECTION ---
             if vc.playing and not vc.paused:
                 current_pos = vc.position
                 last_pos = self.last_positions.get(guild.id, -1)
 
-                # If position hasn't moved in 30 seconds
                 if current_pos == last_pos:
                     count = self.stuck_counts.get(guild.id, 0) + 1
                     self.stuck_counts[guild.id] = count
-                    
-                    if count >= 2: # Stuck for 60 seconds total
-                        logger.warning(f"FailSafe: Track stuck in {guild.name}. Attempting skip/reset.")
+
+                    if count >= 3: # 90 seconds stuck
+                        logger.warning(f"FailSafe: Track stuck in {guild.name}. Skipping.")
                         self.last_positions[guild.id] = -1
                         self.stuck_counts[guild.id] = 0
-                        
-                        # Notify
-                        channel_id = self.bot.get_player_text_channel(guild.id)
-                        if channel_id:
-                            ch = self.bot.get_channel(channel_id)
-                            await safe_send(ch, "⚠️ **FailSafe:** Song stuck detected. Auto-skipping...")
-                        
                         try:
                             await vc.skip(force=True)
-                        except wavelink.exceptions.LavalinkException:
-                            logger.error(f"FailSafe: Player 404 (Ghost Session) in {guild.name}. Force resetting.")
-                            await self.emergency_disconnect(guild, "Ghost Player Detected (404)")
-                        except Exception as e:
-                            logger.error(f"FailSafe: Error skipping stuck track: {e}")
+                        except Exception:
+                            await self.emergency_disconnect(guild, "Stuck Song Hard Fail")
                 else:
-                    # Reset counters if moving
                     self.last_positions[guild.id] = current_pos
                     self.stuck_counts[guild.id] = 0
 
     async def emergency_disconnect(self, guild, reason):
-        """Force kills a connection."""
         try:
             if guild.voice_client:
                 await guild.voice_client.disconnect(force=True)
@@ -660,66 +638,76 @@ class FailSafe(commands.Cog):
         except Exception as e:
             logger.error(f"Failed emergency disconnect: {e}")
 
-    # --- Listeners for Internal Errors ---
-
-    @commands.Cog.listener()
-    async def on_wavelink_track_stuck(self, payload: wavelink.TrackStuckEventPayload):
-        """Called when Lavalink detects a stuck track internally."""
-        logger.warning(f"Track stuck: {payload.track.title}")
-        channel = self.bot.get_player_text_channel(payload.player.guild.id)
-        if channel:
-            ch = self.bot.get_channel(channel)
-            await safe_send(ch, f"⚠️ **Glitch Detected:** {payload.track.title} got stuck. Skipping!")
-        
-        await payload.player.skip(force=True)
-
     @commands.Cog.listener()
     async def on_wavelink_track_exception(self, payload: wavelink.TrackExceptionEventPayload):
-        """Called when a track crashes (e.g., 403 Forbidden, Decode Error)."""
         logger.error(f"Track exception: {payload.exception}")
-        channel = self.bot.get_player_text_channel(payload.player.guild.id)
-        if channel:
-            ch = self.bot.get_channel(channel)
-            await safe_send(ch, f"❌ **Error:** Cannot play {payload.track.title}. Skipping...")
-        
-        await payload.player.skip(force=True)
-
-    # --- Manual Repair Command ---
+        if "404" in str(payload.exception) or "Not Found" in str(payload.exception):
+            await self.emergency_disconnect(payload.player.guild, "Track Error 404")
+        else:
+            await payload.player.skip(force=True)
 
     @commands.hybrid_command(name="repair", aliases=["fix", "failsafe"])
     async def repair(self, ctx):
-        """🚨 Panic Button: Resets the bot's voice state completely."""
-        await ctx.send("🚨 **Running Emergency Repair Protocols...**")
-        
-        step_msg = await ctx.send("1️⃣ Disconnecting from Voice...")
-        
-        # 1. Force Disconnect
+        """🚨 Panic Button: Resets connection, fixes Stage state & enforces 24/7."""
+        await ctx.send("🚨 **Running Deep Repair Protocols...**")
+        step_msg = await ctx.send("1️⃣ Terminating Zombie Connections...")
+
         if ctx.guild.voice_client:
             try:
                 await ctx.guild.voice_client.disconnect(force=True)
             except Exception as e:
                 logger.error(f"Repair disconnect error: {e}")
-        
-        await step_msg.edit(content="2️⃣ Clearing Internal Cache...")
-        
-        # 2. Clear Database/Cache
+
         db.clear_history(ctx.guild.id)
         if ctx.guild.id in self.bot.autoplay:
             del self.bot.autoplay[ctx.guild.id]
-        
-        await step_msg.edit(content="3️⃣ Re-establishing Connection...")
-        
-        # 3. Attempt Re-join (if author is in VC)
-        if ctx.author.voice:
+
+        await step_msg.edit(content="2️⃣ Checking 24/7 Configuration...")
+
+        is_247 = db.get_247_status(ctx.guild.id)
+        home_channel_id = db.get_247_channel(ctx.guild.id)
+        target_channel = None
+
+        if is_247 and home_channel_id:
+            target_channel = ctx.guild.get_channel(home_channel_id)
+            if not target_channel:
+                await step_msg.edit(content="⚠️ Saved 24/7 channel not found. Disabling 24/7 Mode.")
+                db.set_247_status(ctx.guild.id, False)
+
+        if not target_channel and ctx.author.voice:
+            target_channel = ctx.author.voice.channel
+
+        await asyncio.sleep(2)
+
+        if target_channel:
+            await step_msg.edit(content=f"3️⃣ Reconnecting to {target_channel.mention}...")
             try:
-                vc = await robust_connect(ctx.author.voice.channel, ctx)
+                vc = await target_channel.connect(cls=wavelink.Player, self_deaf=True)
+
+                # STAGE FIX: Ensure we are a speaker
+                if isinstance(target_channel, discord.StageChannel):
+                    try:
+                        await ctx.guild.me.edit(suppress=False)
+                        await step_msg.edit(content="🎤 Joined Stage as Speaker.")
+                    except discord.Forbidden:
+                        await step_msg.edit(content="⚠️ Joined Stage but missing 'Request to Speak' permission.")
+                    except Exception:
+                        pass
+
                 vc.text_channel = ctx.channel
                 self.bot.set_player_text_channel(ctx.guild.id, ctx.channel.id)
-                await step_msg.edit(content="✅ **Repair Complete!** You can play music again.")
+
+                status_text = "✅ **Repair Complete!** "
+                if is_247 and home_channel_id:
+                    status_text += "Restored to **24/7 Channel**."
+                else:
+                    status_text += "You can play music now."
+
+                await step_msg.edit(content=status_text)
             except Exception as e:
-                await step_msg.edit(content=f"❌ **Repair Failed:** Could not rejoin. ({e})")
+                await step_msg.edit(content=f"❌ **Repair Failed:** Could not connect. Error: `{e}`")
         else:
-            await step_msg.edit(content="✅ **Repair Complete!** Bot reset. Join a VC to play.")
+            await step_msg.edit(content="✅ **Bot Reset.** Join a voice channel and run `/join` to start.")
 
 # --- Lyrics Fetcher ---
 class LyricsFetcher:
@@ -1443,10 +1431,10 @@ class ConnectionOptimizer(commands.Cog):
         """
         # 1. Check if the bot is actually playing in this guild
         player: wavelink.Player = discord.utils.get(self.bot.voice_clients, guild=interaction.guild)
-        
+
         if not player or not player.connected:
             return await interaction.response.send_message(
-                "❌ | **No Active Connection:** I am not currently connected to a voice channel.", 
+                "❌ | **No Active Connection:** I am not currently connected to a voice channel.",
                 ephemeral=True
             )
 
@@ -1455,7 +1443,7 @@ class ConnectionOptimizer(commands.Cog):
         # 2. Get Current Node Stats
         current_node = player.node
         current_stats = current_node.stats
-        
+
         # Format stats for display
         # 'penalty' is a calculated load score (lower is better) used by Lavalink
         current_load = current_stats.system_load
@@ -1465,7 +1453,7 @@ class ConnectionOptimizer(commands.Cog):
         # We look for the node with the lowest 'penalty' or 'load'
         available_nodes = wavelink.Pool.nodes.values()
         best_node = current_node
-        
+
         # Simple heuristic: Lowest system load
         for node in available_nodes:
             if node.stats.system_load < best_node.stats.system_load:
@@ -1473,12 +1461,12 @@ class ConnectionOptimizer(commands.Cog):
 
         # 4. Action: Switch or Stay
         embed = discord.Embed(title="📶 Connection Optimization", color=0x2b2d31)
-        
+
         if best_node != current_node:
             try:
                 # Attempt to move the player to the new node
                 await player.transfer_to(best_node)
-                
+
                 embed.description = (
                     f"**Optimization Successful**\n"
                     f"Moved from node `{current_node.identifier}` to `{best_node.identifier}`.\n\n"
@@ -1486,7 +1474,7 @@ class ConnectionOptimizer(commands.Cog):
                     f"📉 Load: `{current_load:.2f}` → `{best_node.stats.system_load:.2f}`"
                 )
                 embed.color = discord.Color.green()
-                
+
             except Exception as e:
                 embed.description = f"**Optimization Failed:** Could not transfer node.\n`{str(e)}`"
                 embed.color = discord.Color.red()
@@ -1505,7 +1493,7 @@ class ConnectionOptimizer(commands.Cog):
     async def optimize_error(self, interaction: discord.Interaction, error):
         if isinstance(error, app_commands.MissingPermissions):
             await interaction.response.send_message(
-                "⛔ | **Access Denied:** You must be an Administrator to optimize the connection.", 
+                "⛔ | **Access Denied:** You must be an Administrator to optimize the connection.",
                 ephemeral=True
             )
 
@@ -1513,9 +1501,10 @@ async def setup(bot):
     await bot.add_cog(ConnectionOptimizer(bot))
 
 # --- Player Controller View ---
+# --- Player Controller View ---
 class PlayerControls(discord.ui.View):
     def __init__(self, player: wavelink.Player):
-        super().__init__(timeout=180)
+        super().__init__(timeout=None)
         self.player = player
         self._update_button_styles()
 
@@ -1523,419 +1512,196 @@ class PlayerControls(discord.ui.View):
         if not self.player:
             return
 
+        # Update Pause/Resume button style based on state
         for child in self.children:
             if getattr(child, 'emoji', None) == '⏯️':
                 child.style = discord.ButtonStyle.secondary if self.player.paused else discord.ButtonStyle.success
                 break
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Global Permission & Voice Check"""
         if not interaction.guild.voice_client:
             await interaction.response.send_message("❌ I am not connected to a voice channel.", ephemeral=True)
             return False
 
         bot_channel = interaction.guild.voice_client.channel
         if not interaction.user.voice or interaction.user.voice.channel != bot_channel:
-            await interaction.response.send_message(f"🚫 You must be in {bot_channel.mention} to use the controls!", ephemeral=True)
+            await interaction.response.send_message(f"🚫 You must be in {bot_channel.mention} to use controls!", ephemeral=True)
             return False
 
+        # Stage Permission Check
+        if isinstance(bot_channel, discord.StageChannel):
+            music_cog = interaction.client.get_cog("Music")
+            if music_cog:
+                current_mode = music_cog.stage_settings.get(interaction.guild.id, "admin")
+                if current_mode == "admin":
+                    is_admin = interaction.user.guild_permissions.administrator or interaction.user.guild_permissions.manage_guild
+                    is_mod = any(r.name.lower() in ["dj", "moderator", "mod", "admin"] for r in interaction.user.roles)
+                    is_owner = interaction.user.id in OWNER_IDS
+
+                    if not (is_admin or is_mod or is_owner):
+                        await interaction.response.send_message("🔒 **Stage Locked:** Controls restricted to Moderators.", ephemeral=True)
+                        return False
         return True
 
     async def update_seek_message(self, interaction, seconds):
-        """Seek safely by seconds (positive forward, negative back)."""
-        if not self.player:
-            try:
-                await interaction.response.send_message("❌ Player unavailable.", ephemeral=True)
-            except Exception:
-                pass
-            return
+        if not self.player or not self.player.current:
+            return await interaction.response.send_message("❌ Nothing playing.", ephemeral=True)
 
-        # ensure player has a current track and necessary attrs
-        try:
-            current = getattr(self.player, "current", None)
-            position = getattr(self.player, "position", None)
-            if not current or (position is None):
-                try:
-                    await interaction.response.send_message("❌ No track is currently playing.", ephemeral=True)
-                except Exception:
-                    pass
-                return
+        position = int(self.player.position)
+        length = int(self.player.current.length)
+        new_pos = max(0, min(position + int(seconds * 1000), length))
 
-            # compute new position in milliseconds
-            cur_pos_ms = int(position or 0)
-            length_ms = int(getattr(current, "length", 0) or 0)
-            new_pos = max(0, min(cur_pos_ms + int(seconds * 1000), length_ms))
+        await self.player.seek(new_pos)
+        direction = "⏩" if seconds > 0 else "⏪"
+        await interaction.response.send_message(f"{direction} Seeked {abs(seconds)}s", ephemeral=True)
 
-            try:
-                await self.player.seek(new_pos)
-            except Exception as e:
-                logger.exception(f"Failed to seek player: {e}")
-                try:
-                    await interaction.response.send_message("❌ Seek failed.", ephemeral=True)
-                except Exception:
-                    pass
-                return
+    # ==============================
+    # ROW 0: PRIMARY PLAYBACK
+    # ==============================
 
-            action = "⏩" if seconds > 0 else "⏪"
-            minutes = (new_pos // 1000) // 60
-            secs = (new_pos // 1000) % 60
-            try:
-                await interaction.response.send_message(f"{action} Seeked to {minutes}:{secs:02d}", ephemeral=True)
-            except Exception:
-                try:
-                    await interaction.followup.send(f"{action} Seeked to {minutes}:{secs:02d}", ephemeral=True)
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.exception(f"Unexpected error in update_seek_message: {e}")
-            try:
-                await interaction.response.send_message("❌ Error while seeking.", ephemeral=True)
-            except Exception:
-                pass
-
-    @discord.ui.button(emoji="🔉", style=discord.ButtonStyle.secondary, row=0)
-    async def vol_down_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.player:
-            return
-
-        new_vol = max(0, self.player.volume - 10)
-        await self.player.set_volume(new_vol)
-        try:
-            await interaction.response.send_message(f"🔉 Volume: {new_vol}%", ephemeral=True)
-        except discord.HTTPException:
-            pass
+    @discord.ui.button(emoji="❤️", style=discord.ButtonStyle.secondary, row=0, custom_id="btn_like")
+    async def like_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Placeholder for future logic
+        await interaction.response.send_message("❤️ **Added to Liked Songs** (Coming Soon)", ephemeral=True)
 
     @discord.ui.button(emoji="⏮️", style=discord.ButtonStyle.primary, row=0)
     async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.player:
-            try:
-                await interaction.response.send_message("❌ Player unavailable.", ephemeral=True)
-            except Exception:
-                pass
-            return
-
-        # Defer quickly to avoid "already responded" errors later
+        if not self.player: return
         try:
-            await interaction.response.defer(ephemeral=True)
+            guild_id = interaction.guild.id
+            history = db.get_last_two_tracks(guild_id)
+            if not history or len(history) < 2:
+                await self.player.seek(0)
+                return await interaction.response.send_message("⏮️ Replaying track.", ephemeral=True)
+
+            prev = history[1]
+            db.remove_last_track(guild_id)
+
+            search = f"ytsearch:{prev[0]} {prev[2]}"
+            res = await wavelink.Playable.search(search)
+            if res:
+                track = res[0]
+                track.is_rewind = True
+                await self.player.play(track, replace=True)
+                await interaction.response.send_message(f"⏮️ Playing previous: **{prev[0]}**", ephemeral=True)
         except Exception:
-            # ignore; proceed
-            pass
-
-        try:
-            guild_id = getattr(interaction.guild, "id", None)
-            if guild_id is None:
-                await interaction.followup.send("❌ Guild information missing.", ephemeral=True)
-                return
-
-            history_tracks = db.get_last_two_tracks(guild_id)
-            if not history_tracks or len(history_tracks) < 2:
-                # if track playing, just restart
-                if getattr(self.player, "playing", False) or getattr(self.player, "paused", False):
-                    try:
-                        await self.player.seek(0)
-                        await interaction.followup.send("⏮️ Replaying from start (No previous track).", ephemeral=True)
-                    except Exception:
-                        await interaction.followup.send("❌ Unable to replay current track.", ephemeral=True)
-                    return
-                await interaction.followup.send("❌ No history.", ephemeral=True)
-                return
-
-            prev_track_data = history_tracks[1]
-            # attempt to remove last track but continue even if fails
-            try:
-                db.remove_last_track(guild_id)
-            except Exception:
-                logger.debug("remove_last_track failed but continuing", exc_info=True)
-
-            # Put current track back into queue if exists and queue supports put_at
-            try:
-                if getattr(self.player, "current", None) and hasattr(self.player.queue, "put_at"):
-                    self.player.queue.put_at(0, self.player.current)
-            except Exception:
-                logger.debug("Failed to put current track back to queue", exc_info=True)
-
-            clean_title = (prev_track_data[0] or "").split("(")[0].split("[")[0].strip()
-            search_query = f"ytsearch:{clean_title} {prev_track_data[2] or ''}".strip()
-            try:
-                search_res = await wavelink.Playable.search(search_query)
-            except Exception as e:
-                logger.exception(f"Search failed for prev_button: {e}")
-                await interaction.followup.send("❌ Search failed.", ephemeral=True)
-                return
-
-            if not search_res:
-                await interaction.followup.send("❌ Track not found.", ephemeral=True)
-                return
-
-            # extract track from search result robustly
-            try:
-                if isinstance(search_res, wavelink.Playlist) and getattr(search_res, "tracks", None):
-                    track_to_play = search_res.tracks[0]
-                elif isinstance(search_res, (list, tuple)) and len(search_res) > 0:
-                    track_to_play = search_res[0]
-                else:
-                    # some wrappers expose .tracks or [0]
-                    track_to_play = getattr(search_res, "tracks", [None])[0] or (search_res[0] if hasattr(search_res, "__getitem__") else None)
-            except Exception:
-                track_to_play = None
-
-            if track_to_play:
-                try:
-                    track_to_play.is_rewind = True
-                    await self.player.play(track_to_play, replace=True)
-                    await interaction.followup.send(f"⏮️ Playing: **{prev_track_data[0]}**", ephemeral=True)
-                except Exception as e:
-                    logger.exception(f"Failed to play previous track: {e}")
-                    await interaction.followup.send("❌ Could not load track.", ephemeral=True)
-            else:
-                await interaction.followup.send("❌ Could not load track.", ephemeral=True)
-
-        except Exception as e:
-            logger.exception(f"Previous track error: {e}")
-            try:
-                await interaction.followup.send("❌ Error going back.", ephemeral=True)
-            except Exception:
-                pass
+            await interaction.response.send_message("❌ Error going back.", ephemeral=True)
 
     @discord.ui.button(emoji="⏯️", style=discord.ButtonStyle.success, row=0)
     async def pause_resume_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.player:
-            try:
-                await interaction.response.send_message("❌ Player unavailable.", ephemeral=True)
-            except Exception:
-                pass
-            return
-
-        try:
-            if getattr(self.player, "paused", False):
-                await self.player.pause(False)
-                button.style = discord.ButtonStyle.success
-            else:
-                await self.player.pause(True)
-                button.style = discord.ButtonStyle.secondary
-
-            # attempt safe edit first, fallback to response
-            try:
-                await interaction.response.edit_message(view=self)
-            except Exception:
-                try:
-                    await interaction.followup.send("⏸️ Player state toggled.", ephemeral=True)
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.exception(f"Pause/Resume error: {e}")
-            try:
-                await interaction.response.send_message("❌ Failed to toggle pause/resume.", ephemeral=True)
-            except Exception:
-                pass
+        if not self.player: return
+        is_paused = not self.player.paused
+        await self.player.pause(is_paused)
+        button.style = discord.ButtonStyle.secondary if is_paused else discord.ButtonStyle.success
+        await interaction.response.edit_message(view=self)
 
     @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.primary, row=0)
     async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.player:
-            try:
-                await interaction.response.send_message("❌ Player unavailable.", ephemeral=True)
-            except Exception:
-                pass
-            return
+        if not self.player: return
+        await self.player.skip(force=True)
+        await interaction.response.send_message("⏭️ Skipped.", ephemeral=True)
 
-        try:
-            queue = getattr(self.player, "queue", None)
-            current = getattr(self.player, "current", None)
-            is_empty = True
-            try:
-                # some queue objects have is_empty attribute or __len__
-                if queue is None:
-                    is_empty = True
-                elif hasattr(queue, "is_empty"):
-                    is_empty = bool(queue.is_empty)
-                else:
-                    is_empty = len(queue) == 0
-            except Exception:
-                is_empty = True
+    @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger, row=0)
+    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.player: return
+        is_247 = db.get_247_status(interaction.guild.id)
+        self.player.queue.clear()
+        await self.player.stop()
 
-            if is_empty and not current:
-                await interaction.response.send_message("❌ Nothing to skip.", ephemeral=True)
-                return
+        msg = "⏹️ Stopped."
+        if is_247:
+            msg += " (24/7 Active - Staying connected)"
+        else:
+            await self.player.disconnect()
+            msg += " Disconnected."
+        await interaction.response.send_message(msg, ephemeral=True)
 
-            try:
-                await self.player.skip(force=True)
-                await interaction.response.send_message("⏭️ Skipped.", ephemeral=True)
-            except Exception as e:
-                logger.exception(f"Skip operation failed: {e}")
-                await interaction.response.send_message("❌ Failed to skip.", ephemeral=True)
-        except Exception as e:
-            logger.exception(f"Unexpected skip_button error: {e}")
-            try:
-                await interaction.response.send_message("❌ Failed to skip (unexpected).", ephemeral=True)
-            except Exception:
-                pass
+    # ==============================
+    # ROW 1: VOLUME & MODES
+    # ==============================
 
-    @discord.ui.button(emoji="🔊", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(emoji="🔉", style=discord.ButtonStyle.secondary, row=1)
+    async def vol_down_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.player: return
+        vol = max(0, self.player.volume - 10)
+        await self.player.set_volume(vol)
+        await interaction.response.send_message(f"🔉 Volume: {vol}%", ephemeral=True)
+
+    @discord.ui.button(emoji="🔊", style=discord.ButtonStyle.secondary, row=1)
     async def vol_up_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.player:
-            return
+        if not self.player: return
+        vol = min(1000, self.player.volume + 10)
+        await self.player.set_volume(vol)
+        await interaction.response.send_message(f"🔊 Volume: {vol}%", ephemeral=True)
 
-        new_vol = min(1000, self.player.volume + 10)
-        await self.player.set_volume(new_vol)
-        try:
-            await interaction.response.send_message(f"🔊 Volume: {new_vol}%", ephemeral=True)
-        except discord.HTTPException:
-            pass
+    @discord.ui.button(emoji="🔁", label="Loop", style=discord.ButtonStyle.secondary, row=1)
+    async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.player: return
+        mode = self.player.queue.mode
+        if mode == wavelink.QueueMode.normal:
+            self.player.queue.mode = wavelink.QueueMode.loop
+            button.style = discord.ButtonStyle.success
+            button.label = "Track"
+        elif mode == wavelink.QueueMode.loop:
+            self.player.queue.mode = wavelink.QueueMode.loop_all
+            button.style = discord.ButtonStyle.success
+            button.label = "Queue"
+        else:
+            self.player.queue.mode = wavelink.QueueMode.normal
+            button.style = discord.ButtonStyle.secondary
+            button.label = "Loop"
+        await interaction.response.edit_message(view=self)
 
-    @discord.ui.button(label="-30s", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(emoji="♾️", label="Auto", style=discord.ButtonStyle.secondary, row=1, custom_id="btn_autoplay")
+    async def autoplay_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.player: return
+        guild_id = interaction.guild.id
+
+        # Toggle Autoplay
+        current_state = interaction.client.is_autoplay_enabled(guild_id)
+        new_state = not current_state
+        interaction.client.set_autoplay_enabled(guild_id, new_state)
+
+        if new_state:
+            button.style = discord.ButtonStyle.success
+            msg = "♾️ **Autoplay Enabled**"
+        else:
+            button.style = discord.ButtonStyle.secondary
+            msg = "♾️ **Autoplay Disabled**"
+
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(msg, ephemeral=True)
+
+    @discord.ui.button(emoji="⏱️", style=discord.ButtonStyle.secondary, row=1)
+    async def speed_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.player: return
+        await interaction.response.send_message("⏱️ **Speed Control**", view=SpeedView(self.player), ephemeral=True)
+
+    # ==============================
+    # ROW 2: SEEK & EFFECTS
+    # ==============================
+
+    @discord.ui.button(label="-30s", style=discord.ButtonStyle.secondary, row=2)
     async def seek_back_30(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.update_seek_message(interaction, -30)
 
-    @discord.ui.button(label="-10s", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="-10s", style=discord.ButtonStyle.secondary, row=2)
     async def seek_back_10(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.update_seek_message(interaction, -10)
 
-    @discord.ui.button(label="+10s", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(emoji="🎚️", label="EQ", style=discord.ButtonStyle.secondary, row=2)
+    async def eq_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.player: return
+        await interaction.response.send_message("🎚️ **Equalizer**", view=EqualizerView(self.player), ephemeral=True)
+
+    @discord.ui.button(label="+10s", style=discord.ButtonStyle.secondary, row=2)
     async def seek_fwd_10(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.update_seek_message(interaction, 10)
 
-    @discord.ui.button(label="+30s", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="+30s", style=discord.ButtonStyle.secondary, row=2)
     async def seek_fwd_30(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.update_seek_message(interaction, 30)
-
-    @discord.ui.button(emoji="🔁", label="Off", style=discord.ButtonStyle.secondary, row=2)
-    async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.player:
-            return
-
-        current_mode = self.player.queue.mode
-        if current_mode == wavelink.QueueMode.normal:
-            self.player.queue.mode = wavelink.QueueMode.loop
-            self.player.autoplay = wavelink.AutoPlayMode.disabled
-            button.label = "Track"
-            button.emoji = "🔂"
-            button.style = discord.ButtonStyle.success
-            msg = "🔂 Loop: **Track**"
-        elif current_mode == wavelink.QueueMode.loop:
-            self.player.queue.mode = wavelink.QueueMode.loop_all
-            self.player.autoplay = wavelink.AutoPlayMode.disabled
-            button.label = "Queue"
-            button.emoji = "🔁"
-            button.style = discord.ButtonStyle.success
-            msg = "🔁 Loop: **Queue**"
-        else:
-            self.player.queue.mode = wavelink.QueueMode.normal
-            button.label = "Off"
-            button.emoji = "➡️"
-            button.style = discord.ButtonStyle.secondary
-            msg = "➡️ Loop **Off**"
-
-        try:
-            await interaction.response.edit_message(view=self)
-            await interaction.followup.send(msg, ephemeral=True)
-        except discord.HTTPException:
-            pass
-
-    @discord.ui.button(emoji="🎚️", style=discord.ButtonStyle.secondary, row=2)
-    async def eq_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.player:
-            return
-
-        await interaction.response.send_message("🎚️ **Equalizer**", view=EqualizerView(self.player), ephemeral=True)
-
-    @discord.ui.button(emoji="⏱️", style=discord.ButtonStyle.secondary, row=2)
-    async def speed_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.player:
-            return
-
-        await interaction.response.send_message("⏱️ **Speed Control**", view=SpeedView(self.player), ephemeral=True)
-
-    @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger, row=2)
-    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # 1. Defer immediately to prevent "Unknown Interaction" (Timeout) errors
-        try:
-            await interaction.response.defer(ephemeral=True)
-        except discord.NotFound:
-            return  # Interaction is already dead
-        except Exception:
-            pass  # Continue if already deferred
-
-        if not self.player:
-            try:
-                await interaction.followup.send("❌ Player unavailable.", ephemeral=True)
-            except Exception:
-                pass
-            return
-
-        try:
-            # Attempt to disable autoplay via client hook if present
-            try:
-                if hasattr(interaction.client, 'set_autoplay_enabled'):
-                    interaction.client.set_autoplay_enabled(interaction.guild.id, False)
-            except Exception:
-                logger.debug("set_autoplay_enabled hook failed", exc_info=True)
-
-            try:
-                if getattr(self.player, "channel", None) and isinstance(self.player.channel, discord.VoiceChannel):
-                    # Best-effort: clear any special status on channel
-                    try:
-                        await self.player.channel.edit(reason=None)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-            # Count queue safely
-            try:
-                queue_len = len(self.player.queue) if self.player and getattr(self.player, "queue", None) else 0
-            except Exception:
-                queue_len = 0
-
-            # Logic for 24/7 vs Normal Stop
-            if db.get_247_status(interaction.guild.id):
-                # 24/7 active: stop playback but stay connected
-                try:
-                    if getattr(self.player, "queue", None):
-                        try:
-                            self.player.queue.clear()
-                        except Exception:
-                            pass
-                    await self.player.stop()
-                    try:
-                        db.clear_history(interaction.guild.id)
-                    except Exception:
-                        pass
-                    
-                    await interaction.followup.send(
-                        f"⏹️ Stopped & cleared {queue_len} queued tracks (24/7 active). Autoplay disabled.",
-                        ephemeral=True
-                    )
-                except Exception as e:
-                    logger.exception(f"Stop error (24/7): {e}")
-                    await interaction.followup.send("❌ Failed to stop.", ephemeral=True)
-            else:
-                # Normal disconnect
-                try:
-                    try:
-                        if getattr(self.player, "queue", None):
-                            self.player.queue.clear()
-                    except Exception:
-                        pass
-                    try:
-                        db.clear_history(interaction.guild.id)
-                    except Exception:
-                        pass
-                    await self.player.disconnect()
-                    
-                    await interaction.followup.send(
-                        f"👋 Disconnected & cleared {queue_len} queued tracks.",
-                        ephemeral=True
-                    )
-                except Exception as e:
-                    logger.exception(f"Disconnect error: {e}")
-                    await interaction.followup.send("❌ Failed to disconnect.", ephemeral=True)
-
-        except Exception as e:
-            logger.exception(f"Unexpected stop_button error: {e}")
-            try:
-                await interaction.followup.send("❌ Stop failed.", ephemeral=True)
-            except Exception:
-                pass
-
 
 # --- Manual EQ View ---
 class ManualEQView(discord.ui.View):
@@ -2239,7 +2005,7 @@ def create_now_playing_embed(track: wavelink.Playable) -> discord.Embed:
     # Attempt to resolve provider icon
     custom_data = getattr(track, "custom_payload", {})
     provider = custom_data.get("provider", "default")
-    
+
     # Fallback provider detection if not in payload
     if provider == "default" and track.uri:
         if "spotify" in track.uri: provider = "spotify"
@@ -2314,7 +2080,7 @@ async def robust_connect(channel: discord.VoiceChannel, ctx=None):
     """
     if not channel:
         return None
-    
+
     guild = channel.guild
     vc = guild.voice_client
 
@@ -2337,28 +2103,28 @@ async def robust_connect(channel: discord.VoiceChannel, ctx=None):
     for attempt in range(retries):
         try:
             player = await channel.connect(cls=wavelink.Player, self_deaf=True, timeout=20)
-            
+
             # FORCE DEAFEN CHECK (The Fix)
             # Sometimes the initial handshake misses the deafen state
             if not guild.me.voice or not guild.me.voice.self_deaf:
                 await guild.change_voice_state(channel=channel, self_deaf=True)
-                
+
             return player
         except (asyncio.TimeoutError, discord.ClientException, Exception) as e:
             logger.warning(f"Connection attempt {attempt+1}/{retries} failed: {e}")
-            
+
             if channel.guild.voice_client:
                 try:
                     await channel.guild.voice_client.disconnect(force=True)
                 except:
                     pass
-            
+
             if attempt == retries - 1:
                 if ctx:
                     await safe_send(ctx.channel, "❌ **Connection Failed:** Network is unstable. Try changing the Voice Region.")
                 raise e
-            
-            await asyncio.sleep(2) 
+
+            await asyncio.sleep(2)
     return None
 
 # --- Custom Bot Class ---
@@ -2432,7 +2198,7 @@ class MoodyMusicBot(commands.AutoShardedBot):
         if not track:
             return
 
-        
+
         embed = discord.Embed(
             title="🎶 Now Playing",
             description=f"**{track.title}**\n{track.author}",
@@ -2449,39 +2215,6 @@ class MoodyMusicBot(commands.AutoShardedBot):
         except Exception as e:
             logger.error(f"Failed to resend Now Playing: {e}")
 
-
-    async def on_voice_state_update(self, member, before, after):
-        # Ignore non-bot events
-        if not member.bot or member.id != self.user.id:
-            return
-
-        guild = member.guild
-        player: wavelink.Player = guild.voice_client
-
-        if not player:
-            return
-
-        # BOT WAS DRAGGED TO ANOTHER VC
-        if before.channel and after.channel and before.channel.id != after.channel.id:
-            logger.info(f"Bot dragged in {guild.name}: {before.channel} -> {after.channel}")
-
-            try:
-                # 🔹 Rebind internal state
-                player.channel = after.channel
-
-                # 🔹 Reset broken UI state
-                player._paused = False
-
-                # 🔹 Restore 24/7 safety
-                if db.get_247_status(guild.id):
-                    player.autoplay = wavelink.AutoPlayMode.disabled
-
-                # 🔹 Resend NOW PLAYING if track exists
-                if player.current:
-                    await self._resend_now_playing(player)
-
-            except Exception as e:
-                logger.error(f"VC drag recovery failed: {e}")
 
 
     async def setup_hook(self):
@@ -2700,10 +2433,9 @@ class MoodyMusicBot(commands.AutoShardedBot):
 `{p}trivia stop`"""
                     help_embed.add_field(name="🎮 Games", value=games_val, inline=False)
 
-                    admin_val = f"""`{p}setup` - Create 24/7 channel
-`{p}247` - Toggle 24/7
-`{p}prefix <new>`
-`{p}sync` - Sync slash cmds"""
+                    admin_val = f"""`{p}adminhelp` - View all Admin Tools
+`{p}setup` - Create 24/7 channel
+`{p}247` - Toggle 24/7"""
                     help_embed.add_field(name="⚙️ Admin", value=admin_val, inline=False)
 
                     await interaction.response.send_message(embed=help_embed, ephemeral=True)
@@ -2730,45 +2462,82 @@ class Music(commands.Cog):
         self._empty_channel_tasks = {}
         self.last_actions = {}
         self.rejoin_counters = {}
+        self.stage_settings = {}
 
     def clean_song_title(self, title):
         if not title:
             return ""
         return title.split('(')[0].split('[')[0].strip()[:80]
 
+
+    @commands.hybrid_command(name="stage_mode")
+    @is_owner_or_admin()
+    async def stage_mode(self, ctx, mode: str):
+        """Set control mode for Stage Channels (admin/audience)"""
+        mode = mode.lower()
+        if mode not in ["admin", "audience"]:
+            await ctx.send("❌ Invalid mode. Use `admin` (Mods only) or `audience` (Everyone).")
+            return
+
+        self.stage_settings[ctx.guild.id] = mode
+        await ctx.send(f"🎤 **Stage Control:** Set to `{mode.upper()}` mode.\n(Admin: Only Mods can play • Audience: Everyone can play)")
+
     async def validate_voice_status(self, ctx):
-            """
-            Checks if the user is in the same voice channel as the bot.
-            Returns True if safe to proceed, False if command should stop.
-            """
-            # 1. User not in voice
-            if not ctx.author.voice:
-                await ctx.send("🚫 **You must be in a voice channel to use this command.**")
-                return False
+        """
+        Validates voice state, checks Stage 'Busy' mode, and enforces Audience/Admin permissions.
+        """
+        # 1. User not in voice
+        if not ctx.author.voice:
+            await ctx.send("🚫 **You must be in a voice channel to use this command.**")
+            return False
 
-            # 2. Bot not connected (Safe to proceed, command logic handles 'not connected' errors)
-            if not ctx.voice_client:
-                return True
+        # 2. Bot not connected -> Safe to proceed (will connect next)
+        if not ctx.voice_client:
+            return True
 
-            # 3. Channel Mismatch check
-            bot_channel = ctx.voice_client.channel
-            user_channel = ctx.author.voice.channel
+        bot_channel = ctx.voice_client.channel
+        user_channel = ctx.author.voice.channel
 
-            if bot_channel.id != user_channel.id:
+        # 3. Channel Mismatch & Busy Check
+        if bot_channel.id != user_channel.id:
+            # If bot is in a Stage Channel, it is "Busy"
+            if isinstance(bot_channel, discord.StageChannel):
                 embed = discord.Embed(
-                    title="🚫 Access Denied",
-                    description=f"I am currently active in **{bot_channel.mention}**.\nYou must join that channel to use music commands.",
+                    title="🚫 Bot Busy in Stage",
+                    description=f"I am currently performing live in **{bot_channel.mention}**.\nJoin the Stage to listen!",
                     color=discord.Color.red()
                 )
-                # Add a button to jump directly to the channel
                 view = discord.ui.View()
                 btn = discord.ui.Button(label=f"Join {bot_channel.name}", url=bot_channel.jump_url, style=discord.ButtonStyle.link)
                 view.add_item(btn)
-                
                 await ctx.send(embed=embed, view=view, ephemeral=True)
                 return False
 
-            return True
+            # Normal Voice Mismatch
+            embed = discord.Embed(
+                title="🚫 Access Denied",
+                description=f"I am active in **{bot_channel.mention}**.\nJoin that channel to use music commands.",
+                color=discord.Color.red()
+            )
+            await ctx.send(embed=embed, ephemeral=True)
+            return False
+
+        # 4. Stage Audience Control Logic
+        if isinstance(bot_channel, discord.StageChannel):
+            # Check configured mode (Default to 'admin' for safety)
+            mode = self.stage_settings.get(ctx.guild.id, "admin")
+
+            # If in Admin mode, check permissions
+            if mode == "admin":
+                is_admin = ctx.author.guild_permissions.administrator or ctx.author.guild_permissions.manage_guild
+                # Check for common Mod role names
+                is_mod = any(r.name.lower() in ["dj", "moderator", "mod", "admin"] for r in ctx.author.roles)
+
+                if not (is_admin or is_mod or ctx.author.id in OWNER_IDS):
+                    await ctx.send("🔒 **Stage Locked:** Only Admins/Mods can control the bot in this Stage.\nAsk an Admin to change this with `/stage_mode audience`.", ephemeral=True)
+                    return False
+
+        return True
 
 
     @commands.Cog.listener()
@@ -2794,7 +2563,7 @@ class Music(commands.Cog):
         # CASE A: BOT WAS DISCONNECTED (Left Voice)
         # ==========================================
         if before.channel is not None and after.channel is None:
-            
+
             # Stop if the bot is shutting down
             if self.bot.is_closed():
                 return
@@ -2844,7 +2613,7 @@ class Music(commands.Cog):
             logger.warning(f"🔄 Bot disconnected in {guild.name} (Attempt {count}/3). Waiting 5s...")
 
             # Wait to prevent rapid-fire API spam
-            await asyncio.sleep(5) 
+            await asyncio.sleep(5)
 
             # Double check: Did someone manually reconnect us during the sleep?
             if guild.voice_client and guild.voice_client.connected:
@@ -2857,22 +2626,22 @@ class Music(commands.Cog):
                         await guild.voice_client.disconnect(force=True)
                     except:
                         pass
-                
+
                 # Attempt Connection
                 player = await home_channel.connect(cls=wavelink.Player, self_deaf=True)
-                
+
                 # --- FIX: FORCE DEAFEN ---
                 # Explicitly apply deafen if the initial handshake missed it
                 if not guild.me.voice or not guild.me.voice.self_deaf:
-                     await guild.change_voice_state(channel=home_channel, self_deaf=True)
+                    await guild.change_voice_state(channel=home_channel, self_deaf=True)
 
                 # Reset Player State (stop autoplay, clear text channel binding)
                 player.autoplay = wavelink.AutoPlayMode.disabled
                 if hasattr(player, 'text_channel'):
-                    player.text_channel = None 
-                
+                    player.text_channel = None
+
                 logger.info(f"✅ Successfully auto-rejoined 24/7 channel in {guild.name}")
-                
+
             except Exception as e:
                 logger.error(f"❌ Failed to auto-rejoin 24/7 channel in {guild.name}: {e}")
 
@@ -2891,14 +2660,15 @@ class Music(commands.Cog):
     @commands.Cog.listener()
     async def on_wavelink_track_start(self, payload: wavelink.TrackStartEventPayload):
         player = payload.player
-        if not player:
-            return
+        if not player: return
 
+        # Ignore if trivia game is active
         if player.guild.id in self.trivia_games and self.trivia_games[player.guild.id].active:
             return
 
         track = payload.track
 
+        # Update History & Stats
         if track.uri and ("youtube.com" in track.uri or "youtu.be" in track.uri):
             video_id = extract_video_id(track.uri)
             if video_id:
@@ -2913,32 +2683,25 @@ class Music(commands.Cog):
         if requester_id:
             db.update_user_stats(requester_id, player.guild.id)
 
+        # Determine Provider Icon
         provider = custom_data.get("provider", "default")
         if provider == "default" and track.uri:
-            if "spotify.com" in track.uri:
-                provider = "spotify"
-            elif "music.apple.com" in track.uri:
-                provider = "applemusic"
-            elif "soundcloud.com" in track.uri:
-                provider = "soundcloud"
-            elif "youtube.com" in track.uri or "youtu.be" in track.uri:
-                provider = "youtube"
+            if "spotify" in track.uri: provider = "spotify"
+            elif "apple" in track.uri: provider = "applemusic"
+            elif "soundcloud" in track.uri: provider = "soundcloud"
+            elif "youtu" in track.uri: provider = "youtube"
 
         icon_url = ICONS.get(provider, ICONS["default"])
         status_emoji = "🎵"
 
-        duration_min = int((track.length / 1000) // 60)
-        duration_sec = int((track.length / 1000) % 60)
-
-        total_bars = 15
-        progress_bar = "🔘" + "▬" * (total_bars - 1)
-
+        # --- EMBED CONSTRUCTION (Progress Bar Line REMOVED) ---
         embed = discord.Embed(
-            description=f"## {status_emoji} Now Playing\n**[{track.title}]({track.uri or 'https://youtube.com'})**\nby `{track.author}`\n\n`0:00` {progress_bar} `{duration_min:02d}:{duration_sec:02d}`",
+            description=f"## {status_emoji} Now Playing\n**[{track.title}]({track.uri or 'https://youtube.com'})**\nby `{track.author}`",
             color=discord.Color.from_rgb(138, 43, 226)
         )
         embed.set_author(name=f"Playing on {player.channel.name}", icon_url=icon_url)
 
+        # Artwork
         if custom_data.get("artwork"):
             embed.set_thumbnail(url=custom_data["artwork"])
         elif track.artwork:
@@ -2948,6 +2711,7 @@ class Music(commands.Cog):
             if video_id:
                 embed.set_thumbnail(url=f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg")
 
+        # Footer
         footer_text = f"Source: {provider.capitalize()}"
         if requester_id:
             user = self.bot.get_user(requester_id)
@@ -2955,6 +2719,7 @@ class Music(commands.Cog):
                 footer_text += f" • Requested by: {user.display_name}"
         embed.set_footer(text=footer_text, icon_url=self.bot.user.display_avatar.url)
 
+        # Send Message
         channel_id = self.bot.get_player_text_channel(player.guild.id)
         if not channel_id:
             if hasattr(player, 'text_channel') and player.text_channel:
@@ -2963,18 +2728,25 @@ class Music(commands.Cog):
                 return
 
         channel = player.guild.get_channel(channel_id)
-        if not channel:
-            return
+        if not channel: return
 
+        # Delete old controller
         old_msg = getattr(player, 'controller_message', None)
         if old_msg:
-            try:
-                await old_msg.delete()
-            except:
-                pass
+            try: await old_msg.delete()
+            except: pass
 
         try:
-            msg = await channel.send(embed=embed, view=PlayerControls(player))
+            # Init View and Sync Autoplay Button State
+            view = PlayerControls(player)
+
+            # Check if autoplay is ON and color the button Green (Success) if so
+            if self.bot.is_autoplay_enabled(player.guild.id):
+                for child in view.children:
+                    if getattr(child, 'custom_id', '') == 'btn_autoplay':
+                        child.style = discord.ButtonStyle.success
+
+            msg = await channel.send(embed=embed, view=view)
             player.controller_message = msg
             player.text_channel = channel
         except discord.Forbidden:
@@ -2982,16 +2754,15 @@ class Music(commands.Cog):
         except Exception as e:
             logger.error(f"Failed to send controller: {e}")
 
+        # Update Voice Channel Status
         try:
             if player.channel and isinstance(player.channel, discord.VoiceChannel):
                 status_text = f"{status_emoji} {track.title[:45]} • {track.author[:45]}"
                 if len(status_text) > 128:
                     status_text = status_text[:125] + "..."
                 await player.channel.edit(status=status_text)
-        except discord.Forbidden:
+        except:
             pass
-        except Exception as e:
-            logger.warning(f"Failed to update VC status: {e}")
 
     async def add_autoplay_track(self, player: wavelink.Player) -> Optional[wavelink.Playable]:
         guild_id = player.guild.id
@@ -3036,7 +2807,7 @@ class Music(commands.Cog):
             logger.error(f"Failed to search autoplay track: {e}")
 
         return None
-    
+
     @commands.hybrid_command(name="sync")
     @is_owner_or_admin()
     async def sync(self, ctx: commands.Context):
@@ -3054,19 +2825,19 @@ class Music(commands.Cog):
         """Check Bot, Redis, Voice, and Lavalink latency"""
         # 1. Bot (Websocket) Latency
         bot_latency = round(self.bot.latency * 1000)
-        
+
         # 2. Redis Latency
         redis_latency = db.get_redis_latency()
         redis_status = f"`{redis_latency}ms`" if redis_latency != -1 else "❌ **Offline**"
-        
+
         # 3. Voice Latency (if connected)
         voice_info = "Not Connected"
         if ctx.guild.voice_client:
             vc: wavelink.Player = ctx.guild.voice_client
             if hasattr(vc, "ping") and vc.ping >= 0:
-                 voice_info = f"`{vc.ping}ms`"
+                voice_info = f"`{vc.ping}ms`"
             else:
-                 voice_info = "📶 Connecting..."
+                voice_info = "📶 Connecting..."
 
         # 4. Lavalink Node Latency (NEW)
         node = wavelink.Pool.get_node(LAVALINK_IDENTIFIER)
@@ -3084,10 +2855,10 @@ class Music(commands.Cog):
         embed.add_field(name="🗄️ Redis Database", value=redis_status, inline=True)
         embed.add_field(name="🌋 Lavalink Node", value=lava_latency, inline=True)
         embed.add_field(name="🎵 Voice Server", value=voice_info, inline=True)
-        
+
         await ctx.send(embed=embed)
 
-    @commands.hybrid_command(name="quickfix", aliases=["fixlag"]) 
+    @commands.hybrid_command(name="quickfix", aliases=["fixlag"])
     async def quickfix(self, ctx):
         """Attempt to fix lag or audio stuttering"""
         vc: wavelink.Player = ctx.voice_client
@@ -3097,7 +2868,7 @@ class Music(commands.Cog):
             return
 
         status_msg = await ctx.send("🛠️ **Optimising connection...** (Resetting Audio Buffer)")
-        
+
         try:
             # Step 1: Soft Fix (Pause/Resume to flush UDP buffer)
             was_paused = vc.paused
@@ -3105,7 +2876,7 @@ class Music(commands.Cog):
                 await vc.pause(True)
                 await asyncio.sleep(1.5) # Allow buffer to drain
                 await vc.pause(False)
-            
+
             # Step 2: Check Region (Informational)
             region = ctx.guild.voice_client.channel.rtc_region
             region_name = region if region else "Automatic"
@@ -3120,7 +2891,7 @@ class Music(commands.Cog):
             embed.set_footer(text="If lag persists, try changing the Voice Channel Region in Server Settings.")
 
             await status_msg.edit(content=None, embed=embed)
-            
+
         except Exception as e:
             logger.error(f"Optimise failed: {e}")
             await status_msg.edit(content="❌ Failed to optimise connection.")
@@ -3215,7 +2986,7 @@ class Music(commands.Cog):
         # Build prompt
         prompt = ""
         vc: Optional[wavelink.Player] = ctx.voice_client
-        
+
         # EDGE CASE 1: Build prompt even if player is None or Idle
         try:
             if mood_or_query and isinstance(mood_or_query, str) and mood_or_query.strip():
@@ -3252,7 +3023,7 @@ class Music(commands.Cog):
         recommendations: List[str] = []
         try:
             recommendations = await asyncio.wait_for(self.bot.ai_recommender.get_recommendations(prompt), timeout=20)
-            
+
             # normalize
             if recommendations and isinstance(recommendations, (list, tuple)):
                 recommendations = [str(x).strip() for x in recommendations if x and str(x).strip()]
@@ -3272,7 +3043,7 @@ class Music(commands.Cog):
                 if vc and getattr(vc, "current", None):
                     uri = getattr(vc.current, "uri", "") or getattr(vc.current, "webpage_url", "") or ""
                     seed_id = extract_video_id(uri) or uri
-                
+
                 if not seed_id and ctx.guild:
                     history = db.get_last_two_tracks(ctx.guild.id)
                     if history:
@@ -3318,7 +3089,7 @@ class Music(commands.Cog):
                 if interaction.user.id != ctx.author.id:
                     await interaction.response.send_message("🚫 Only the command author can select a song!", ephemeral=True)
                     return
-                
+
                 try:
                     await interaction.response.defer()
                 except Exception:
@@ -3347,7 +3118,7 @@ class Music(commands.Cog):
                     else:
                         await interaction.followup.send("🚫 Join a voice channel first.", ephemeral=True)
                         return
-                
+
                 # --- EDGE CASE FIX: ENSURE TEXT CHANNEL IS SET ---
                 # This fixes the "Now Playing" screen not showing.
                 # We force the bot to recognize the channel where the interaction occurred as the output channel.
@@ -3407,15 +3178,15 @@ class Music(commands.Cog):
                         # We do NOT send "Now Playing" here because on_track_start will send the Embed.
                         # Sending a confirmation avoids duplicate clutter.
                         await interaction.followup.send(f"✅ Loaded **{track.title}**...", ephemeral=True)
-                        
+
                         # EDGE CASE: If the view was attached to a message, try to disable it to prevent double clicks
                         try:
                             view.stop()
                             if thinking_msg:
-                                await thinking_msg.edit(view=None) 
-                        except: 
+                                await thinking_msg.edit(view=None)
+                        except:
                             pass
-                            
+
                     else:
                         await interaction.followup.send(f"➕ Added **{track.title}** to queue")
                 except Exception:
@@ -3443,6 +3214,28 @@ class Music(commands.Cog):
             await safe_send(ctx.channel, "❌ Something went wrong while preparing recommendations.")
 
 
+    @commands.hybrid_command(name="adminhelp", aliases=["admintools", "aho"])
+    @is_owner_or_admin()
+    async def admin_help_command(self, ctx):
+        """Show restricted admin commands"""
+        p = db.get_prefix(ctx.guild.id) if ctx.guild else "m!"
+
+        embed = discord.Embed(
+            title="🛡️ Admin Tools",
+            description="Restricted commands for Server Admins & Bot Owners.",
+            color=discord.Color.red()
+        )
+
+        # Server Management
+        server_cmds = f"""`{p}setup` - Create 24/7 dedicated channel
+`{p}247 [channel]` - Force enable 24/7 mode
+`{p}prefix <symbol>` - Change server prefix
+`{p}repair` - Fix connection issues / Force reset
+`{p}set_avatar_guild <image>` - Server-specific bot pfp"""
+        embed.add_field(name="⚙️ Server Management", value=server_cmds, inline=False)
+
+        await ctx.send(embed=embed, ephemeral=True)
+
     @commands.hybrid_command(name="help")
     async def help_command(self, ctx):
         """Show help menu"""
@@ -3465,24 +3258,26 @@ class Music(commands.Cog):
 
         effects_cmds = f"""`{p}eq` - Equalizer
 `{p}speed [0.5-2.0]`
-`{p}current` - Now playing"""
-        embed.add_field(name="🎚️ Effects", value=effects_cmds, inline=False)
+`{p}current` - Now playing
+`{p}suggest <mood>` - AI Recommendations"""
+        embed.add_field(name="🎚️ Effects & AI", value=effects_cmds, inline=False)
 
         games_cmds = f"""`{p}games` - Trivia
 `{p}trivia stop`"""
         embed.add_field(name="🎮 Games", value=games_cmds, inline=False)
 
-        admin_cmds = f"""`{p}setup` - Create 24/7 channel
-`{p}247` - Toggle 24/7
-`{p}prefix <new>`
-`{p}sync` - Sync slash cmds"""
-        embed.add_field(name="⚙️ Admin", value=admin_cmds, inline=False)
+        # Updated Footer to point to new Admin Help
+        embed.add_field(
+            name="🛡️ Admin Tools",
+            value=f"Admins can use `{p}adminhelp` to view restricted commands.",
+            inline=False
+        )
 
         await ctx.send(embed=embed)
 
     @commands.hybrid_command(name="join", aliases=["j", "connect"])
     async def join(self, ctx):
-        """Join your voice channel (Protected)"""
+        """Join your voice/stage channel (Protected)"""
         if not ctx.author.voice:
             await ctx.send("🚫 You need to be in a voice channel first!")
             return
@@ -3490,57 +3285,57 @@ class Music(commands.Cog):
         user_channel = ctx.author.voice.channel
         vc = ctx.voice_client
 
-        # If bot is already connected
+        # Prevent hijacking if playing for others
         if vc:
-            # If already in the same channel
             if vc.channel.id == user_channel.id:
                 await ctx.send("✅ I am already in your channel!")
                 return
-            
-            # --- PROTECTIVE LOGIC ---
-            # Check for humans (excluding bots)
+
             listeners = [m for m in vc.channel.members if not m.bot]
-            
             if listeners:
                 embed = discord.Embed(
                     title="🚫 Setup Active",
-                    description=f"I am currently playing for **{len(listeners)} users** in **{vc.channel.mention}**.\nI cannot move right now.",
+                    description=f"I am currently playing for **{len(listeners)} users** in **{vc.channel.mention}**.",
                     color=discord.Color.red()
                 )
-                view = discord.ui.View()
-                btn = discord.ui.Button(label=f"Join {vc.channel.name}", url=vc.channel.jump_url, style=discord.ButtonStyle.link)
-                view.add_item(btn)
-                await ctx.send(embed=embed, view=view, ephemeral=True)
+                await ctx.send(embed=embed, ephemeral=True)
                 return
 
-            # If no humans, move to new channel
             await vc.move_to(user_channel)
-            await ctx.send(f"✅ Moved to **{user_channel.name}**")
-            return
+        else:
+            try:
+                vc = await robust_connect(user_channel, ctx)
+                vc.autoplay = wavelink.AutoPlayMode.disabled
+                vc.text_channel = ctx.channel
+                self.bot.set_player_text_channel(ctx.guild.id, ctx.channel.id)
+            except Exception as e:
+                await ctx.send(f"❌ Failed to join: {e}")
+                return
 
-        # Normal Connect
-        try:
-            vc = await robust_connect(user_channel, ctx)
-            vc.autoplay = wavelink.AutoPlayMode.disabled
-            vc.text_channel = ctx.channel
-            self.bot.set_player_text_channel(ctx.guild.id, ctx.channel.id)
+        # --- STAGE CHANNEL SPEAKER LOGIC ---
+        if isinstance(user_channel, discord.StageChannel):
+            try:
+                # Attempt to become a speaker (suppress=False)
+                await ctx.guild.me.edit(suppress=False)
+                await ctx.send(f"✅ Joined Stage **{user_channel.name}** and requested to speak.")
+            except discord.Forbidden:
+                await ctx.send(f"✅ Joined Stage **{user_channel.name}**, but I need 'Request to Speak' permissions to play audio!", delete_after=10)
+            except Exception as e:
+                logger.warning(f"Stage speak request failed: {e}")
+                await ctx.send(f"✅ Joined Stage **{user_channel.name}**.")
+        else:
             await ctx.send(f"✅ Joined **{user_channel.name}**")
-        except discord.Forbidden:
-            await ctx.send("❌ I don't have permission to join that channel!")
-        except Exception as e:
-            logger.error(f"Join error: {e}")
-            await ctx.send("❌ Failed to join voice channel.")
 
     @commands.hybrid_command(name="play", aliases=["p"])
     async def play(self, ctx, *, query: str):
         """Play a song or add to queue"""
-        
+
         # 1. Voice Channel Guard (Replaces old Busy Check & User Voice Check)
         if not await self.validate_voice_status(ctx):
             return
 
         await ctx.defer()
-        
+
         # 2. Setup Variables
         user_vc = ctx.author.voice.channel
         bot_vc = ctx.voice_client
@@ -3560,9 +3355,9 @@ class Music(commands.Cog):
             vc = bot_vc
             # Check for ghost player state
             if not vc.guild:
-                 await ctx.send("❌ Internal error: Player state invalid. Try `/repair`.")
-                 return
-            
+                await ctx.send("❌ Internal error: Player state invalid. Try `/repair`.")
+                return
+
             # Update text channel for now playing messages
             vc.text_channel = ctx.channel
             self.bot.set_player_text_channel(ctx.guild.id, ctx.channel.id)
@@ -3776,7 +3571,7 @@ class Music(commands.Cog):
         """Skip the current track (with race-condition protection)"""
         if not await self.validate_voice_status(ctx):
             return
-        
+
         vc: wavelink.Player = ctx.voice_client
 
         if not vc or not vc.playing:
@@ -3851,11 +3646,11 @@ class Music(commands.Cog):
 
         # --- EDGE CASE FIX: 24/7 Protection ---
         is_247 = db.get_247_status(ctx.guild.id)
-        
+
         # If 24/7 is ON, only Admins or DJ can stop
         if is_247 and not (ctx.author.guild_permissions.administrator or ctx.author.id in OWNER_IDS):
-             await ctx.send("🔒 **24/7 Mode is Active.** Only Admins can disconnect the bot.\nUse `/clear` to remove songs instead.")
-             return
+            await ctx.send("🔒 **24/7 Mode is Active.** Only Admins can disconnect the bot.\nUse `/clear` to remove songs instead.")
+            return
 
         self.bot.set_autoplay_enabled(ctx.guild.id, False)
 
@@ -4200,7 +3995,7 @@ class Music(commands.Cog):
                         await target_channel.connect(cls=wavelink.Player, self_deaf=True)
                     elif ctx.voice_client.channel.id != target_channel.id:
                         await ctx.voice_client.move_to(target_channel)
-                    
+
                     # Ensure deafen is applied
                     await ctx.guild.change_voice_state(channel=target_channel, self_deaf=True)
 
@@ -4213,7 +4008,7 @@ class Music(commands.Cog):
 
                 if not ctx.voice_client:
                     await target_channel.connect(cls=wavelink.Player, self_deaf=True)
-                
+
                 # Ensure deafen is applied
                 await ctx.guild.change_voice_state(channel=target_channel, self_deaf=True)
 
@@ -4486,10 +4281,29 @@ def is_player_safe(player: wavelink.Player) -> bool:
         return True
     except Exception:
         return False
-
 class ProfileManagement(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+
+    # ---------------------------------------------------------
+    # 🔒 GLOBAL COG PERMISSION CHECK
+    # ---------------------------------------------------------
+    async def cog_check(self, ctx):
+        """
+        This runs before EVERY command in this Cog.
+        If it returns False, the command stops immediately.
+        """
+        if ctx.author.id in OWNER_IDS:
+            return True
+
+        # This message is sent if a non-owner tries to use ANY command in this class
+        embed = discord.Embed(
+            title="⛔ Access Denied",
+            description="These commands are restricted to **Bot Owners** only.\nPlease contact the bot owners if you need changes made.",
+            color=discord.Color.red()
+        )
+        await ctx.send(embed=embed, ephemeral=True)
+        return False
 
     async def _validate_image(self, ctx, attachment: discord.Attachment):
         """Helper to validate image types"""
@@ -4504,7 +4318,7 @@ class ProfileManagement(commands.Cog):
         if attachment.content_type not in valid_types:
             await ctx.send("❌ Invalid file type. Please upload a **PNG, JPG, or GIF**.", ephemeral=True)
             return None
-            
+
         return await attachment.read()
 
     # ==========================
@@ -4515,9 +4329,7 @@ class ProfileManagement(commands.Cog):
     @app_commands.describe(file="The image file to use")
     async def set_avatar_global(self, ctx, file: discord.Attachment = None):
         """Sets the bot's Global Avatar."""
-        if ctx.author.id not in OWNER_IDS:
-            return await ctx.send("⛔ **Access Denied:** Owner only.", ephemeral=True)
-
+        # Manual check removed; handled by cog_check
         await ctx.defer()
         image_data = await self._validate_image(ctx, file)
         if not image_data: return
@@ -4530,24 +4342,23 @@ class ProfileManagement(commands.Cog):
         except Exception as e:
             await ctx.send(f"❌ Error: `{e}`. (You might be rate-limited)", ephemeral=True)
 
-    @commands.hybrid_command(name="set_avatar_guild", description="[Admin] Sets the bot's Avatar for THIS server only.")
+    @commands.hybrid_command(name="set_avatar_guild", description="[Owner] Sets the bot's Avatar for THIS server only.")
     @app_commands.describe(file="The image file to use")
-    @commands.has_permissions(administrator=True)
     async def set_avatar_guild(self, ctx, file: discord.Attachment = None):
         """Sets the bot's Guild-Specific Avatar (Direct API Method)."""
+        # Admin permission removed; handled by cog_check (Owner Only)
         await ctx.defer()
         image_data = await self._validate_image(ctx, file)
         if not image_data: return
 
         try:
             # 🔧 MANUAL API FIX: Bypass Member.edit() limitation
-            # We convert the image to Base64 and hit the endpoint directly
             b64_data = discord.utils._bytes_to_base64_data(image_data)
-            
+
             await self.bot.http.request(
                 discord.http.Route(
-                    "PATCH", 
-                    "/guilds/{guild_id}/members/@me", 
+                    "PATCH",
+                    "/guilds/{guild_id}/members/@me",
                     guild_id=ctx.guild.id
                 ),
                 json={"avatar": b64_data}
@@ -4562,22 +4373,22 @@ class ProfileManagement(commands.Cog):
         except Exception as e:
             await ctx.send(f"❌ Failed: `{e}`", ephemeral=True)
 
-    @commands.hybrid_command(name="reset_avatar_guild", description="[Admin] Resets the bot's avatar in this server to the Global one.")
-    @commands.has_permissions(administrator=True)
+    @commands.hybrid_command(name="reset_avatar_guild", description="[Owner] Resets the bot's avatar in this server to the Global one.")
     async def reset_avatar_guild(self, ctx):
         """Resets the bot's Guild-Specific Avatar."""
+        # Admin permission removed; handled by cog_check (Owner Only)
         await ctx.defer()
         try:
             # 🔧 MANUAL API FIX: Send None (null) to reset
             await self.bot.http.request(
                 discord.http.Route(
-                    "PATCH", 
-                    "/guilds/{guild_id}/members/@me", 
+                    "PATCH",
+                    "/guilds/{guild_id}/members/@me",
                     guild_id=ctx.guild.id
                 ),
                 json={"avatar": None}
             )
-            
+
             await ctx.send(f"✅ **Avatar Reset:** I am now using my Global Avatar in {ctx.guild.name}.")
         except discord.Forbidden:
             await ctx.send("❌ I need the **Change Nickname** permission to do this.", ephemeral=True)
@@ -4592,9 +4403,7 @@ class ProfileManagement(commands.Cog):
     @app_commands.describe(file="The banner image (Recommended 600x240)")
     async def set_banner_global(self, ctx, file: discord.Attachment = None):
         """Sets the bot's Global Banner."""
-        if ctx.author.id not in OWNER_IDS:
-            return await ctx.send("⛔ **Access Denied:** Owner only.", ephemeral=True)
-
+        # Manual check removed; handled by cog_check
         await ctx.defer()
         image_data = await self._validate_image(ctx, file)
         if not image_data: return
@@ -4620,9 +4429,7 @@ class ProfileManagement(commands.Cog):
     @commands.hybrid_command(name="reset_banner_global", description="[Owner] Removes the bot's Global Banner.")
     async def reset_banner_global(self, ctx):
         """Resets (Removes) the Global Banner."""
-        if ctx.author.id not in OWNER_IDS:
-            return await ctx.send("⛔ **Access Denied:** Owner only.", ephemeral=True)
-        
+        # Manual check removed; handled by cog_check
         await ctx.defer()
         try:
             await self.bot.user.edit(banner=None)
